@@ -4,28 +4,51 @@ Electricity Load Forecasting - Ile-de-France (2021-2023)
 
 This script:
   1. Loads the cleaned dataset (Excel file, 30-minute step)
-  2. Builds features (calendar, cyclic encoding, lags, rolling means,
-     public holidays, school holidays, extreme-weather flags)
-  3. Splits the data chronologically (train: 2021-2022, test: 2023)
-  4. Trains one LightGBM model per horizon (30 min, 1 h, 1 day, 7 days)
-  5. Provides a `predict_from_datetime()` function: give it a date/time
-     from 2023 and it returns the four forecasts next to the true values
+  2. Builds two kinds of features:
+       - descriptors of the TARGET instant (the moment we forecast):
+         calendar (time of day, weekday, season), public holidays, holiday
+         eves / days after, bridge days, school holidays, Christmas period,
+         August, and weather (temperature, smoothed temperature, heating /
+         cooling degrees, solar radiation, wind);
+       - the STATE at the forecast origin (consumption now, recent means,
+         last known value at the same time of day / week, temperature now).
+  3. Splits the data chronologically:
+       train      : 2021-01 -> 2022-09
+       validation : 2022-10 -> 2022-12  (early stopping)
+       test       : 2023                (never seen during training)
+  4. Trains direct LightGBM models, one family per range of forecast leads
+     (30 min ... 7 days). Each family has three models: a central forecast and
+     the 10% / 90% quantiles, which give an uncertainty band (calibrated on the
+     validation period). The models predict a ratio to the consumption level
+     of the last 24 h, which makes them robust to level shifts such as the
+     energy-saving plan of winter 2022-2023.
+  5. Evaluates on 2023 against naive baselines, with perfect weather and
+     with a simulated weather-forecast error, and saves everything in results/.
 
-Note on 2024:
-  The dataset stops at 2023-12-31, so we cannot forecast a real 2024 date
-  (the recent past needed by the short-term models does not exist for 2024).
-  We therefore demonstrate on 2023, which is the held-out test year the
-  models never saw during training. This is the rigorous approach.
+Key idea: the lead (how far ahead) is itself a feature, and every point of the
+7-day curve is predicted DIRECTLY from the origin. No prediction is ever fed
+back in, so errors do not accumulate.
+
+About the weather:
+  The dataset contains OBSERVED weather. Using it at the target instant is
+  equivalent to a perfect weather forecast. In operations you would use a real
+  weather forecast (e.g. Meteo-France / Open-Meteo), which is less accurate,
+  so we also report the scores with a simulated forecast error whose size
+  grows with the lead (about 1 C at day 1, 3 C at day 7).
+
+Run from the project root:
+    python src/script.py
 """
 
 import os
-import datetime as dt
+import time
+from dataclasses import dataclass
 
-import pandas as pd
-import numpy as np
-import lightgbm as lgb
 import joblib
-from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error, r2_score
 
 from jours_feries_france import JoursFeries
 from vacances_scolaires_france import SchoolHolidayDates
@@ -35,14 +58,23 @@ from vacances_scolaires_france import SchoolHolidayDates
 # Configuration - paths are resolved relative to the PROJECT ROOT, so the
 # script works whether you run it from the project folder or from src/.
 # ---------------------------------------------------------------------------
-# This file lives in <project>/src/ ; the project root is one level up.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_PATH = os.path.join(PROJECT_ROOT, "dataset", "Ile_de_france_clean_dataset.xlsx")
 SHEET_NAME = "donnees_idf_30min_lisse"
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
+CLEAN_DATA_FILE = os.path.join(RESULTS_DIR, "data_clean.parquet")
+BUNDLE_FILE = os.path.join(RESULTS_DIR, "forecast_bundle.joblib")
 
-# Horizons expressed in number of 30-minute steps
+STEP = pd.Timedelta(minutes=30)
+STEPS_PER_DAY = 48
+STEPS_PER_WEEK = 336
+MAX_LEAD = STEPS_PER_WEEK                 # 7 days at a 30-minute resolution
+
+VALID_START = pd.Timestamp("2022-10-01")
+TEST_YEAR = 2023
+
+# Reference horizons, expressed in number of 30-minute steps
 HORIZONS = {
     "30 min": 1,
     "1 hour": 2,
@@ -50,9 +82,39 @@ HORIZONS = {
     "7 days": 336,
 }
 
-# Extreme-weather thresholds (deg C) for Ile-de-France
-COLD_WAVE_THRESHOLD = 0.0     # below this = cold snap (heating peak)
-HEAT_WAVE_THRESHOLD = 30.0    # above this = heat wave (cooling peak)
+# One model family per range of leads (inclusive bounds, in steps).
+# Short ranges near the origin, where the dynamics change fastest.
+LEAD_BUCKETS = [(1, 2), (3, 12), (13, 48), (49, 144), (145, 336)]
+LEADS_PER_ORIGIN = 4                      # leads sampled per origin when training
+
+# The models predict target / reference level. Up to 6 h ahead the best
+# reference is the current value; further out, the mean of the last 24 h.
+SHORT_LEAD_MAX = 12
+
+
+def level_column(bucket_index):
+    return "cons_now" if LEAD_BUCKETS[bucket_index][1] <= SHORT_LEAD_MAX else "cons_mean_24h"
+
+# Central forecast + bounds of the 80% uncertainty band
+QUANTILES = {"p10": 0.10, "p90": 0.90}
+
+LGB_PARAMS = dict(
+    n_estimators=3000,                    # upper bound, early stopping decides
+    learning_rate=0.05,
+    num_leaves=63,
+    min_child_samples=50,
+    subsample=0.8,
+    subsample_freq=1,
+    colsample_bytree=0.8,
+    reg_lambda=1.0,
+    random_state=42,
+    verbose=-1,
+)
+EARLY_STOPPING_ROUNDS = 100
+
+# Physical thresholds (deg C)
+HEATING_BASE = 15.0                       # below this, electric heating starts
+COOLING_BASE = 22.0                       # above this, air conditioning starts
 
 # School-holiday zone for Ile-de-France
 SCHOOL_ZONE = "C"
@@ -61,443 +123,522 @@ SCHOOL_ZONE = "C"
 # ===========================================================================
 # 1. LOAD DATA
 # ===========================================================================
-def load_data(path=DATA_PATH, sheet=SHEET_NAME):
-    """Load the Excel file and build a clean datetime index."""
+def load_excel(path=DATA_PATH, sheet=SHEET_NAME):
+    """Load the Excel file and build a clean, regular 30-minute index."""
     df = pd.read_excel(path, sheet_name=sheet)
 
-    # Rename columns to short names for convenience
     df = df.rename(columns={
         "Electric consumption (MW)": "consumption",
         "temperature (celsius)":     "temperature",
         "Gi (Solar Radiation W/m2)": "solar",
         "Windspeed (m/s)":           "wind",
     })
-
-    # Build a single timestamp from date + time
-    df["timestamp"] = pd.to_datetime(
-        df["date"].astype(str) + " " + df["time"].astype(str)
-    )
-
+    df["timestamp"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str))
     df = df.sort_values("timestamp").set_index("timestamp")
     df = df[["consumption", "temperature", "solar", "wind"]]
+
+    # The models rely on "n steps later = n x 30 min": enforce a regular grid
+    full = pd.date_range(df.index.min(), df.index.max(), freq=STEP)
+    if df.index.has_duplicates or len(full) != len(df):
+        df = df[~df.index.duplicated()].reindex(full).interpolate(limit=4)
     return df
+
+
+def load_data():
+    """Load the cleaned data, from the fast parquet copy when it exists."""
+    if os.path.exists(CLEAN_DATA_FILE):
+        return pd.read_parquet(CLEAN_DATA_FILE)
+    return load_excel()
 
 
 # ===========================================================================
-# 2. FEATURE ENGINEERING
+# 2. FEATURES DESCRIBING ONE INSTANT (used for the TARGET instant)
 # ===========================================================================
-def add_calendar_features(df):
-    """Add basic calendar columns."""
-    df["hour"] = df.index.hour
-    df["dayofweek"] = df.index.dayofweek          # 0 = Monday, 6 = Sunday
-    df["month"] = df.index.month
-    df["dayofyear"] = df.index.dayofyear
-    df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
-    return df
+def calendar_features(index):
+    """Calendar and holiday flags for every timestamp of `index`."""
+    out = pd.DataFrame(index=index)
 
+    # Time of day including minutes (08:00 and 08:30 must differ)
+    hod = index.hour + index.minute / 60
+    out["hod_sin"] = np.sin(2 * np.pi * hod / 24)
+    out["hod_cos"] = np.cos(2 * np.pi * hod / 24)
+    doy = index.dayofyear
+    out["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    out["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
+    out["dow"] = index.dayofweek                          # 0 = Monday
+    out["is_weekend"] = (index.dayofweek >= 5).astype(int)
 
-def add_cyclic_features(df):
-    """Encode cyclic time variables with sine/cosine so that, e.g.,
-    hour 23 is close to hour 0."""
-    def encode(series, period):
-        return np.sin(2 * np.pi * series / period), np.cos(2 * np.pi * series / period)
-
-    df["hour_sin"], df["hour_cos"] = encode(df["hour"], 24)
-    df["month_sin"], df["month_cos"] = encode(df["month"], 12)
-    df["dow_sin"], df["dow_cos"] = encode(df["dayofweek"], 7)
-    return df
-
-
-def add_holiday_features(df):
-    """Add public-holiday and school-holiday flags (France, zone C)."""
-    unique_dates = pd.Series(df.index.date).unique()
-
-    # Public holidays
-    public = {}
-    for d in unique_dates:
-        public[d] = int(JoursFeries.is_bank_holiday(d, zone="Métropole"))
-
-    # School holidays (zone C = Paris / Ile-de-France)
+    # Day-level flags, computed once per day, then mapped to timestamps
+    days = pd.date_range(index.min().normalize(), index.max().normalize(), freq="D")
+    public = pd.Series(
+        [int(JoursFeries.is_bank_holiday(d.date(), zone="Métropole")) for d in days],
+        index=days,
+    )
     checker = SchoolHolidayDates()
-    school = {}
-    for d in unique_dates:
+    school, failures = [], 0
+    for d in days:
         try:
-            school[d] = int(checker.is_holiday_for_zone(d, SCHOOL_ZONE))
+            school.append(int(checker.is_holiday_for_zone(d.date(), SCHOOL_ZONE)))
         except Exception:
-            school[d] = 0
+            school.append(0)
+            failures += 1
+    if failures:
+        print(f"  WARNING: school holidays unknown for {failures} days (set to 0)")
+    school = pd.Series(school, index=days)
 
-    dates = pd.Series(df.index.date, index=df.index)
-    df["is_public_holiday"] = dates.map(public).astype(int)
-    df["is_school_holiday"] = dates.map(school).astype(int)
-    return df
+    next_day = public.shift(-1, fill_value=0)
+    prev_day = public.shift(1, fill_value=0)
+    dow = days.dayofweek
+    day_flags = pd.DataFrame({
+        "is_public_holiday": public,
+        "is_holiday_eve":    ((next_day == 1) & (public == 0)).astype(int),
+        "is_holiday_after":  ((prev_day == 1) & (public == 0)).astype(int),
+        # Monday before a Tuesday holiday / Friday after a Thursday holiday
+        "is_bridge":         (((dow == 0) & (next_day == 1)) |
+                              ((dow == 4) & (prev_day == 1))).astype(int),
+        "is_school_holiday": school,
+        "is_xmas_period":    (((days.month == 12) & (days.day >= 24)) |
+                              ((days.month == 1) & (days.day <= 2))).astype(int),
+        "is_august":         (days.month == 8).astype(int),
+    }, index=days)
 
-
-def add_extreme_weather_features(df):
-    """Flag cold snaps and heat waves from the temperature column.
-    These extreme episodes drive consumption up (heating / cooling)."""
-    df["is_cold_wave"] = (df["temperature"] < COLD_WAVE_THRESHOLD).astype(int)
-    df["is_heat_wave"] = (df["temperature"] > HEAT_WAVE_THRESHOLD).astype(int)
-    return df
-
-
-def add_lag_features(df):
-    """Add past-consumption features. Step = 30 min, so:
-    1 step = 30 min, 2 = 1 h, 48 = 24 h, 336 = 7 days."""
-    df["lag_30min"] = df["consumption"].shift(1)
-    df["lag_1h"]    = df["consumption"].shift(2)
-    df["lag_24h"]   = df["consumption"].shift(48)
-    df["lag_7d"]    = df["consumption"].shift(336)
-
-    # Rolling means (shifted by 1 step to use past only -> no data leakage)
-    df["roll_mean_2h"]  = df["consumption"].shift(1).rolling(4).mean()
-    df["roll_mean_24h"] = df["consumption"].shift(1).rolling(48).mean()
-    return df
+    out = out.join(day_flags.reindex(index.normalize()).set_axis(index))
+    return out
 
 
-def build_features(df):
-    """Apply all feature-engineering steps and drop rows with missing lags."""
-    df = add_calendar_features(df)
-    df = add_cyclic_features(df)
-    df = add_holiday_features(df)
-    df = add_extreme_weather_features(df)
-    df = add_lag_features(df)
-    df = df.dropna()
-    return df
+def weather_features(df):
+    """Weather descriptors. The smoothed temperature mimics the thermal inertia
+    of buildings: a cold spell weighs more after several cold days."""
+    out = pd.DataFrame(index=df.index)
+    out["temp"] = df["temperature"]
+    out["temp_day"] = df["temperature"].rolling(STEPS_PER_DAY, center=True, min_periods=1).mean()
+    out["temp_smooth"] = df["temperature"].ewm(halflife=STEPS_PER_DAY).mean()
+    out["hdd"] = np.maximum(HEATING_BASE - out["temp_smooth"], 0)   # heating degrees
+    out["cdd"] = np.maximum(out["temp_day"] - COOLING_BASE, 0)      # cooling degrees
+    out["solar"] = df["solar"]
+    out["wind"] = df["wind"]
+    return out
 
 
-# ===========================================================================
-# 3. TRAIN / TEST SPLIT
-# ===========================================================================
-def chronological_split(df):
-    """Train on 2021-2022, test on 2023 (no random split for time series)."""
-    train = df[df.index.year < 2023]
-    test = df[df.index.year == 2023]
-    return train, test
-
-
-# The columns given to the model as inputs (raw calendar columns replaced
-# by their cyclic version are excluded).
-FEATURE_COLUMNS = [
-    "temperature", "solar", "wind",
-    "is_weekend", "dayofyear",
-    "hour_sin", "hour_cos", "month_sin", "month_cos", "dow_sin", "dow_cos",
-    "is_public_holiday", "is_school_holiday", "is_cold_wave", "is_heat_wave",
-    "lag_30min", "lag_1h", "lag_24h", "lag_7d",
-    "roll_mean_2h", "roll_mean_24h",
+CALENDAR_COLS = [
+    "hod_sin", "hod_cos", "doy_sin", "doy_cos", "dow", "is_weekend",
+    "is_public_holiday", "is_holiday_eve", "is_holiday_after", "is_bridge",
+    "is_school_holiday", "is_xmas_period", "is_august",
 ]
+WEATHER_COLS = ["temp", "temp_day", "temp_smooth", "hdd", "cdd", "solar", "wind"]
+TEMP_COLS = ["temp", "temp_day", "temp_smooth"]          # shifted by a weather error
+TARGET_COLS = ["T_" + c for c in CALENDAR_COLS + WEATHER_COLS]
+STATE_COLS = [
+    "lead", "cons_now", "cons_prev", "cons_mean_2h", "cons_mean_24h",
+    "cons_same_time_last_day", "cons_same_time_last_week",
+    "temp_now", "temp_smooth_now",
+]
+FEATURE_COLUMNS = TARGET_COLS + STATE_COLS
 
 
 # ===========================================================================
-# 4. MODEL TRAINING
+# 3. DATASET + DESIGN MATRIX
 # ===========================================================================
-def evaluate(name, y_true, y_pred):
-    mape = mean_absolute_percentage_error(y_true, y_pred) * 100
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
-    print(f"{name:22s} | MAPE = {mape:5.2f}%  | RMSE = {rmse:7.1f} MW  | R2 = {r2:.3f}")
-    return {"model": name, "MAPE": mape, "RMSE": rmse, "R2": r2}
+@dataclass
+class Dataset:
+    """Everything needed to build model inputs, stored as aligned arrays."""
+    raw: pd.DataFrame            # consumption, temperature, solar, wind
+    descriptors: pd.DataFrame    # calendar + weather of every instant
+    index: pd.DatetimeIndex
+    cons: np.ndarray
+    mean_2h: np.ndarray
+    mean_24h: np.ndarray
+
+    def position(self, timestamp):
+        return self.index.get_loc(pd.Timestamp(timestamp))
+
+    @property
+    def first_origin(self):
+        """Earliest origin with a full week of history behind it."""
+        return self.index[STEPS_PER_WEEK]
 
 
-def train_one_horizon(train, test, n_steps, name):
-    """Train a LightGBM model that predicts consumption n_steps ahead."""
-    # Target = consumption shifted into the future
-    y_train_full = train["consumption"].shift(-n_steps)
-    y_test_full = test["consumption"].shift(-n_steps)
-
-    ok_train = y_train_full.notna()
-    ok_test = y_test_full.notna()
-
-    X_train = train.loc[ok_train, FEATURE_COLUMNS]
-    y_train = y_train_full[ok_train]
-    X_test = test.loc[ok_test, FEATURE_COLUMNS]
-    y_test = y_test_full[ok_test]
-
-    model = lgb.LGBMRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=7,
-        random_state=42,
-        verbose=-1,
+def prepare_dataset(df):
+    descriptors = pd.concat([calendar_features(df.index), weather_features(df)], axis=1)
+    cons = df["consumption"].to_numpy(dtype=float)
+    return Dataset(
+        raw=df,
+        descriptors=descriptors[CALENDAR_COLS + WEATHER_COLS].astype(float),
+        index=df.index,
+        cons=cons,
+        # Means up to and including the origin (consumption at t is known at t)
+        mean_2h=df["consumption"].rolling(4).mean().to_numpy(),
+        mean_24h=df["consumption"].rolling(STEPS_PER_DAY).mean().to_numpy(),
     )
-    model.fit(X_train, y_train)
-
-    pred = model.predict(X_test)
-    score = evaluate(f"LightGBM {name}", y_test, pred)
-    return model, score
 
 
-def train_all_models(train, test):
-    """Train one model per horizon and return them in a dict."""
-    models = {}
-    scores = []
+def design_matrix(data, origins, leads, temp_error=None):
+    """Model inputs for pairs (origin position, lead in steps).
 
-    # Baseline: consumption 7 days earlier (same hour)
-    base_pred = test["lag_7d"]
-    scores.append(evaluate("Baseline (7 days)", test["consumption"], base_pred))
+    At origin t, consumption up to and including t is known.
+    `temp_error` (deg C, one value per row) shifts the target temperature to
+    simulate an imperfect weather forecast.
+    """
+    origins = np.asarray(origins)
+    leads = np.asarray(leads)
+    targets = origins + leads
 
-    print()
-    for name, n_steps in HORIZONS.items():
-        model, score = train_one_horizon(train, test, n_steps, name)
-        models[name] = model
-        scores.append(score)
+    D = data.descriptors.to_numpy()[targets]
+    X = pd.DataFrame(D, columns=TARGET_COLS)
 
-    return models, pd.DataFrame(scores)
+    if temp_error is not None:
+        for col in TEMP_COLS:
+            X["T_" + col] += temp_error
+        X["T_hdd"] = np.maximum(HEATING_BASE - X["T_temp_smooth"], 0)
+        X["T_cdd"] = np.maximum(X["T_temp_day"] - COOLING_BASE, 0)
+
+    c = data.cons
+    last_day_lag = STEPS_PER_DAY * np.ceil(leads / STEPS_PER_DAY).astype(int)
+    X["lead"] = leads
+    X["cons_now"] = c[origins]
+    X["cons_prev"] = c[origins - 1]
+    X["cons_mean_2h"] = data.mean_2h[origins]
+    X["cons_mean_24h"] = data.mean_24h[origins]
+    X["cons_same_time_last_day"] = c[targets - last_day_lag]      # always <= origin
+    X["cons_same_time_last_week"] = c[targets - STEPS_PER_WEEK]
+    X["temp_now"] = data.descriptors["temp"].to_numpy()[origins]
+    X["temp_smooth_now"] = data.descriptors["temp_smooth"].to_numpy()[origins]
+    return X[FEATURE_COLUMNS]
+
+
+def weather_error_sigma(leads):
+    """Typical std of a temperature forecast error (deg C) vs lead (steps):
+    about 1.1 C at day 1, 2.9 C at day 7."""
+    return 0.8 + 0.3 * np.asarray(leads) / STEPS_PER_DAY
+
+
+def simulated_weather_error(leads, seed=None, correlated=True):
+    """Random temperature errors for the given leads.
+
+    correlated=True: a smooth error along one forecast curve (a real weather
+    forecast is wrong for hours or days in a row, not point by point).
+    """
+    rng = np.random.default_rng(seed)
+    leads = np.asarray(leads)
+    if correlated:
+        phi = 0.98                                   # memory of about 1 day
+        z = np.empty(len(leads))
+        z[0] = rng.standard_normal()
+        for i in range(1, len(leads)):
+            z[i] = phi * z[i - 1] + np.sqrt(1 - phi ** 2) * rng.standard_normal()
+    else:
+        z = rng.standard_normal(len(leads))
+    return weather_error_sigma(leads) * z
+
+
+def bucket_of(leads):
+    """Index of the lead bucket handling each lead."""
+    uppers = np.array([b for _, b in LEAD_BUCKETS])
+    return np.searchsorted(uppers, np.asarray(leads))
+
+
+def sample_pairs(data, origin_mask, bucket, seed):
+    """Training pairs (origin, lead) for one lead bucket."""
+    lo, hi = bucket
+    n = len(data.index)
+    origins = np.flatnonzero(origin_mask)
+    origins = origins[(origins >= STEPS_PER_WEEK) & (origins + hi < n)]
+
+    n_leads = hi - lo + 1
+    if n_leads <= LEADS_PER_ORIGIN:
+        leads = np.tile(np.arange(lo, hi + 1), len(origins))
+        origins = np.repeat(origins, n_leads)
+    else:
+        rng = np.random.default_rng(seed)
+        origins = np.repeat(origins, LEADS_PER_ORIGIN)
+        leads = rng.integers(lo, hi + 1, size=len(origins))
+    return origins, leads
 
 
 # ===========================================================================
-# 5. PREDICTION FROM A CHOSEN DATE/TIME
+# 4. TRAINING
 # ===========================================================================
-def predict_from_datetime(chosen, df_features, models, verbose=False):
+def _fit(X, y, quantile=None, n_estimators=None, eval_set=None):
+    params = dict(LGB_PARAMS)
+    if quantile is not None:
+        params.update(objective="quantile", alpha=quantile)
+    if n_estimators is not None:
+        params["n_estimators"] = int(n_estimators)
+    model = lgb.LGBMRegressor(**params)
+    callbacks = [lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)] if eval_set else None
+    model.fit(X, y, eval_set=eval_set, callbacks=callbacks)
+    return model
+
+
+BAND_LEVEL = 0.80                         # target coverage of the p10-p90 band
+
+
+def train_models(data, cutoff=None, n_iterations=None, band_margins=None, verbose=True):
+    """Train every (bucket, quantile) model.
+
+    The models predict the RATIO  target / reference level (current value for
+    short leads, mean of the last 24 h beyond, see `level_column`). A ratio adapts at once to a change of level (e.g. the energy-saving plan
+    of winter 2022-2023 lowered consumption by 5-10%), while a model trained
+    on raw MW would keep the old level in its trees.
+
+    Default (cutoff=None): early stopping on the validation period chooses the
+    number of trees, and the validation errors calibrate the band (conformal
+    calibration). The models are then refit on all data before the test year.
+
+    Walk-forward (cutoff given): refit on every observation whose target is
+    before `cutoff`, reusing the tree counts and band margins found before.
+
+    Returns (models, iterations) with models[bucket_index] holding the
+    "p50", "p10", "p90" models and the "band_margin".
     """
-    Given a timestamp, return the four forecasts together with the true
-    values (when available, so predictions can be checked).
+    idx = data.index
+    names = ["p50"] + list(QUANTILES)
+    models, iterations = {}, {}
 
-    `chosen`      : a string like "2023-06-27 08:30" or a pandas Timestamp
-    `df_features` : the full feature dataframe (output of build_features)
-    `models`      : dict of trained models (output of train_all_models or
-                    load_models)
-    `verbose`     : if True, also print the result (used for the CLI demo)
+    for b, bucket in enumerate(LEAD_BUCKETS):
+        origins, leads = sample_pairs(data, np.ones(len(idx), bool), bucket, seed=b)
+        X = design_matrix(data, origins, leads)
+        y = data.cons[origins + leads] / X[level_column(b)].to_numpy()
+        t_origin = idx[origins]
+        t_target = idx[origins + leads]
 
-    Returns a DataFrame with one row per horizon.
-    """
-    chosen = pd.Timestamp(chosen)
-
-    if chosen not in df_features.index:
-        raise ValueError(
-            f"{chosen} is not in the dataset. "
-            "Pick a timestamp on a 30-minute mark (e.g. 08:00 or 08:30) "
-            "within 2021-2023."
-        )
-
-    # Feature row for the chosen instant
-    x = df_features.loc[[chosen], FEATURE_COLUMNS]
-
-    if verbose:
-        print(f"\nForecast made from: {chosen}")
-        print("-" * 55)
-
-    results = []
-    for name, n_steps in HORIZONS.items():
-        target_time = chosen + pd.Timedelta(minutes=30 * n_steps)
-        pred = models[name].predict(x)[0]
-
-        # True value, if available in the data
-        if target_time in df_features.index:
-            true = df_features.loc[target_time, "consumption"]
-            error = abs(pred - true) / true * 100
-            actual_val = round(float(true))
-            error_val = round(float(error), 1)
+        if cutoff is None:
+            fit_mask = t_target < VALID_START
+            val_mask = (t_origin >= VALID_START) & (t_target.year < TEST_YEAR)
+            final_mask = t_target.year < TEST_YEAR
         else:
-            actual_val = None
-            error_val = None
+            final_mask = t_target <= pd.Timestamp(cutoff)
 
-        if verbose:
-            true_str = f"{actual_val:8.0f} MW" if actual_val is not None else "     n/a"
-            err_str = f"{error_val:5.1f}%" if error_val is not None else "  n/a"
-            print(f"{name:8s} -> {target_time} | predicted: {pred:8.0f} MW | "
-                  f"actual: {true_str} | error: {err_str}")
+        models[b], iterations[b], val_pred = {}, {}, {}
+        for name in names:
+            q = QUANTILES.get(name)
+            start = time.time()
+            if cutoff is None:
+                probe = _fit(X[fit_mask], y[fit_mask], q,
+                             eval_set=[(X[val_mask], y[val_mask])])
+                n_iter = max(probe.best_iteration_, 50)
+                val_pred[name] = probe.predict(X[val_mask])
+            else:
+                n_iter = n_iterations[b][name]
+            models[b][name] = _fit(X[final_mask], y[final_mask], q, n_estimators=n_iter)
+            iterations[b][name] = n_iter
+            if verbose:
+                print(f"  leads {bucket[0]:>3}-{bucket[1]:<3} {name}: "
+                      f"{n_iter:4d} trees, {final_mask.sum():,} rows, {time.time() - start:5.1f}s")
 
-        results.append({
+        if cutoff is None:
+            # Conformal calibration: how much must the band be widened so that
+            # BAND_LEVEL of the validation points fall inside it?
+            yv = y[val_mask]
+            lo = np.minimum(val_pred["p10"], val_pred["p50"])
+            hi = np.maximum(val_pred["p90"], val_pred["p50"])
+            score = np.maximum(lo - yv, yv - hi)
+            margin = float(np.quantile(score, BAND_LEVEL))
+        else:
+            margin = band_margins[b]
+        models[b]["band_margin"] = margin
+    return models, iterations
+
+
+def band_margins_of(models):
+    return {b: m["band_margin"] for b, m in models.items()}
+
+
+def predict(models, X):
+    """Central forecast and band (MW) for each row of X (any mix of leads)."""
+    out = {name: np.empty(len(X)) for name in ["p10", "p50", "p90"]}
+    buckets = bucket_of(X["lead"].to_numpy())
+    for b in np.unique(buckets):
+        rows = buckets == b
+        for name in out:
+            out[name][rows] = models[b][name].predict(X[rows])
+        # Quantile models are trained separately: make sure p10 <= p50 <= p90,
+        # then apply the calibrated margin
+        out["p10"][rows] = np.minimum(out["p10"][rows], out["p50"][rows]) - models[b]["band_margin"]
+        out["p90"][rows] = np.maximum(out["p90"][rows], out["p50"][rows]) + models[b]["band_margin"]
+        level = X.loc[rows, level_column(b)].to_numpy()  # ratio -> MW
+        for name in out:
+            out[name][rows] *= level
+    return out
+
+
+# ===========================================================================
+# 5. EVALUATION ON THE TEST YEAR
+# ===========================================================================
+def _scores(y, pred):
+    return {
+        "MAPE": float(np.mean(np.abs(y - pred) / y) * 100),
+        "RMSE": float(np.sqrt(mean_squared_error(y, pred))),
+        "R2": float(r2_score(y, pred)),
+    }
+
+
+def test_pairs(data, lead, every=1):
+    """All origins of the test year whose target is also in the test year."""
+    idx = data.index
+    origins = np.flatnonzero(idx.year == TEST_YEAR)[::every]
+    origins = origins[origins + lead < len(idx)]
+    origins = origins[idx[origins + lead].year == TEST_YEAR]
+    return origins, np.full(len(origins), lead)
+
+
+def evaluate(data, models, verbose=True):
+    """Scores on the test year, stored in a dict used by the Streamlit app."""
+    c = data.cons
+    rows, by_daytype, by_month = [], [], []
+
+    for name, lead in HORIZONS.items():
+        origins, leads = test_pairs(data, lead)
+        targets = origins + leads
+        y = c[targets]
+        X = design_matrix(data, origins, leads)
+        pred = predict(models, X)
+
+        err = simulated_weather_error(leads, seed=lead, correlated=False)
+        pred_noisy = predict(models, design_matrix(data, origins, leads, temp_error=err))["p50"]
+
+        last_day_lag = STEPS_PER_DAY * int(np.ceil(lead / STEPS_PER_DAY))
+        row = {"horizon": name, "lead": lead}
+        row.update({f"model_{k}": v for k, v in _scores(y, pred["p50"]).items()})
+        row["model_weather_error_MAPE"] = _scores(y, pred_noisy)["MAPE"]
+        row["persistence_MAPE"] = _scores(y, c[origins])["MAPE"]
+        row["same_time_last_day_MAPE"] = _scores(y, c[targets - last_day_lag])["MAPE"]
+        row["same_time_last_week_MAPE"] = _scores(y, c[targets - STEPS_PER_WEEK])["MAPE"]
+        row["band_coverage_pct"] = float(np.mean((y >= pred["p10"]) & (y <= pred["p90"])) * 100)
+        row["band_width_MW"] = float(np.mean(pred["p90"] - pred["p10"]))
+        rows.append(row)
+
+        # Error by type of target day (where are the hard cases?)
+        ape = np.abs(y - pred["p50"]) / y * 100
+        T = data.descriptors.iloc[targets]
+        groups = {
+            "Weekday": (T["is_weekend"] == 0) & (T["is_public_holiday"] == 0),
+            "Weekend": T["is_weekend"] == 1,
+            "Public holiday": T["is_public_holiday"] == 1,
+            "Holiday eve / after / bridge": (T[["is_holiday_eve", "is_holiday_after",
+                                                "is_bridge"]].sum(axis=1) > 0),
+            "School holidays": T["is_school_holiday"] == 1,
+            "Christmas period": T["is_xmas_period"] == 1,
+        }
+        for g, mask in groups.items():
+            mask = mask.to_numpy()
+            if mask.any():
+                by_daytype.append({"horizon": name, "day_type": g,
+                                   "MAPE": float(ape[mask].mean()), "n_points": int(mask.sum())})
+        months = data.index[targets].month
+        for m in range(1, 13):
+            mask = months == m
+            if mask.any():
+                by_month.append({"horizon": name, "month": m, "MAPE": float(ape[mask].mean())})
+
+    # Error as a function of the lead (subsampled origins to stay fast)
+    by_lead = []
+    for lead in sorted(set([1, 2, 4, 6, 8, 12, 18, 24, 36, 48] + list(range(72, MAX_LEAD + 1, 24)))):
+        origins, leads = test_pairs(data, lead, every=3)
+        y = c[origins + leads]
+        p = predict(models, design_matrix(data, origins, leads))["p50"]
+        err = simulated_weather_error(leads, seed=1000 + lead, correlated=False)
+        pn = predict(models, design_matrix(data, origins, leads, temp_error=err))["p50"]
+        by_lead.append({"lead": lead, "hours": lead / 2,
+                        "MAPE perfect weather": float(np.mean(np.abs(y - p) / y) * 100),
+                        "MAPE weather error": float(np.mean(np.abs(y - pn) / y) * 100)})
+
+    # Feature importance (gain) of each central model
+    importance = {}
+    for b, bucket in enumerate(LEAD_BUCKETS):
+        booster = models[b]["p50"].booster_
+        gain = pd.Series(booster.feature_importance("gain"), index=booster.feature_name())
+        importance[f"{bucket[0]}-{bucket[1]} steps"] = (gain / gain.sum() * 100).sort_values(ascending=False)
+
+    report = {
+        "horizons": pd.DataFrame(rows),
+        "by_daytype": pd.DataFrame(by_daytype),
+        "by_month": pd.DataFrame(by_month),
+        "by_lead": pd.DataFrame(by_lead),
+        "importance": importance,
+    }
+    if verbose:
+        cols = ["horizon", "model_MAPE", "model_weather_error_MAPE", "persistence_MAPE",
+                "same_time_last_day_MAPE", "same_time_last_week_MAPE", "band_coverage_pct"]
+        print(report["horizons"][cols].round(2).to_string(index=False))
+    return report
+
+
+# ===========================================================================
+# 6. FORECASTING FROM A CHOSEN INSTANT
+# ===========================================================================
+def forecast(origin, data, models, max_lead=MAX_LEAD, weather_error=False, seed=None):
+    """Forecast curve from `origin`, every 30 minutes up to `max_lead` steps.
+
+    Returns a DataFrame indexed by target time with columns
+    lead, p10, p50, p90, actual (the real value, known for historical dates)
+    and temp_used (the target temperature given to the model).
+    """
+    pos = data.position(origin)
+    if pos < STEPS_PER_WEEK:
+        raise ValueError(f"Pick an origin after {data.first_origin}: "
+                         "the models need one week of history.")
+    leads = np.arange(1, max_lead + 1)
+    leads = leads[pos + leads < len(data.index)]
+    if len(leads) == 0:
+        raise ValueError("No data after this instant: nothing to compare with.")
+
+    origins = np.full(len(leads), pos)
+    err = simulated_weather_error(leads, seed=seed) if weather_error else None
+    X = design_matrix(data, origins, leads, temp_error=err)
+    pred = predict(models, X)
+
+    targets = pos + leads
+    return pd.DataFrame({
+        "lead": leads,
+        "p10": pred["p10"],
+        "p50": pred["p50"],
+        "p90": pred["p90"],
+        "actual": data.cons[targets],
+        "temp_used": X["T_temp"].to_numpy(),
+        "temp_observed": data.descriptors["temp"].to_numpy()[targets],
+    }, index=data.index[targets])
+
+
+def horizon_table(curve):
+    """The reference horizons, read from a forecast curve."""
+    rows = []
+    for name, lead in HORIZONS.items():
+        hit = curve[curve["lead"] == lead]
+        if hit.empty:
+            continue
+        r = hit.iloc[0]
+        rows.append({
             "horizon": name,
-            "target_time": target_time,
-            "predicted_MW": round(float(pred)),
-            "actual_MW": actual_val,
-            "error_pct": error_val,
+            "target_time": hit.index[0],
+            "predicted_MW": round(float(r["p50"])),
+            "low_MW": round(float(r["p10"])),
+            "high_MW": round(float(r["p90"])),
+            "actual_MW": round(float(r["actual"])),
+            "error_pct": round(float(abs(r["p50"] - r["actual"]) / r["actual"] * 100), 2),
         })
-
-    return pd.DataFrame(results)
-
-
-# ===========================================================================
-# 6. LOAD ALREADY-TRAINED MODELS (used by the Streamlit app)
-# ===========================================================================
-def load_models(results_dir=RESULTS_DIR):
-    """Load the models and feature data saved by a previous training run.
-    Returns (models_dict, df_features)."""
-    models = {}
-    for name in HORIZONS:
-        safe = name.replace(" ", "_")
-        path = os.path.join(results_dir, f"model_{safe}.pkl")
-        models[name] = joblib.load(path)
-
-    data_path = os.path.join(results_dir, "data_with_features.csv")
-    df_features = pd.read_csv(data_path, index_col=0)
-    df_features.index = pd.to_datetime(df_features.index)
-    return models, df_features
+    return pd.DataFrame(rows)
 
 
 # ===========================================================================
-# 7bis. MULTI-STEP DIRECT MODELS (continuous curve without drift)
+# 7. SAVE / LOAD
 # ===========================================================================
-# Grid of forecast steps: dense at the beginning (fast-changing), sparser
-# further out. 336 steps = 7 days at a 30-minute resolution.
-MULTISTEP_GRID = (
-    list(range(1, 13))          # every 30 min for the first 6 hours
-    + list(range(14, 49, 2))    # every 1 h up to 24 h
-    + list(range(54, 169, 6))   # every 3 h up to 3.5 days
-    + list(range(180, 337, 12)) # every 6 h up to 7 days
-)
+def save_bundle(models, iterations, report, path=BUNDLE_FILE):
+    joblib.dump({
+        "models": models,
+        "iterations": iterations,
+        "report": report,
+        "features": FEATURE_COLUMNS,
+        "lead_buckets": LEAD_BUCKETS,
+        "trained_until": f"{TEST_YEAR - 1}-12-31",
+    }, path)
 
 
-def train_multistep_models(train, grid=MULTISTEP_GRID, n_estimators=300):
-    """Train one model per forecast step in the grid.
-
-    Each model predicts directly from the present instant, so no prediction is
-    ever fed back in: there is no error accumulation ('drift'), unlike the
-    recursive approach.
-    """
-    models = {}
-    for step in grid:
-        y = train["consumption"].shift(-step)
-        ok = y.notna()
-        model = lgb.LGBMRegressor(
-            n_estimators=n_estimators,
-            learning_rate=0.05,
-            max_depth=7,
-            random_state=42,
-            verbose=-1,
-        )
-        model.fit(train.loc[ok, FEATURE_COLUMNS], y[ok])
-        models[step] = model
-    return models
-
-
-def multistep_forecast(chosen, df_features, multistep_models, horizon_days=7):
-    """Build a continuous forecast curve using the direct multi-step models.
-
-    Each point is predicted directly from the chosen instant, then the curve is
-    interpolated onto the 30-minute grid for a smooth line.
-
-    Returns a pandas Series (index = future timestamps, values = predicted MW).
-    """
-    chosen = pd.Timestamp(chosen)
-    x = df_features.loc[[chosen], FEATURE_COLUMNS]
-
-    times, values = [], []
-    for step, model in sorted(multistep_models.items()):
-        target = chosen + pd.Timedelta(minutes=30 * step)
-        if target in df_features.index:
-            times.append(target)
-            values.append(float(model.predict(x)[0]))
-
-    if not times:
-        return pd.Series(dtype=float)
-
-    anchors = pd.Series(values, index=times)
-
-    # Interpolate onto every 30-minute step for a smooth curve
-    full_index = pd.date_range(
-        chosen + pd.Timedelta(minutes=30),
-        chosen + pd.Timedelta(days=horizon_days),
-        freq="30min",
-    )
-    full_index = full_index[full_index.isin(df_features.index)]
-    curve = (anchors.reindex(anchors.index.union(full_index))
-                    .interpolate(method="time")
-                    .reindex(full_index))
-    return curve
-
-
-def load_multistep_models(results_dir=RESULTS_DIR):
-    """Load the multi-step models saved during training."""
-    path = os.path.join(results_dir, "models_multistep.pkl")
-    return joblib.load(path)
-
-
-# ===========================================================================
-# 7ter. WALK-FORWARD RETRAINING (expanding window)
-# ===========================================================================
-def walk_forward_train(cutoff, df_features, grid=MULTISTEP_GRID,
-                       n_estimators=300):
-    """Retrain the models using every observation up to `cutoff`.
-
-    This mimics real operating conditions: at the moment of forecasting, all
-    past data is available, not just the fixed 2021-2022 training set.
-
-    Note: in our tests this brought almost no accuracy gain (two years already
-    cover every seasonal regime), but it is methodologically cleaner.
-
-    Returns (horizon_models, multistep_models).
-    """
-    cutoff = pd.Timestamp(cutoff)
-    train = df_features.loc[:cutoff]
-
-    horizon_models = {}
-    for name, n_steps in HORIZONS.items():
-        y = train["consumption"].shift(-n_steps)
-        ok = y.notna()
-        model = lgb.LGBMRegressor(
-            n_estimators=500, learning_rate=0.05, max_depth=7,
-            random_state=42, verbose=-1,
-        )
-        model.fit(train.loc[ok, FEATURE_COLUMNS], y[ok])
-        horizon_models[name] = model
-
-    multistep_models = train_multistep_models(train, grid, n_estimators)
-    return horizon_models, multistep_models
-
-
-# ===========================================================================
-# 7. RECURSIVE FORECAST (continuous curve, step by step)
-# ===========================================================================
-def recursive_forecast(chosen, df_features, models, n_steps=336):
-    """
-    Produce a CONTINUOUS forecast curve by predicting one 30-minute step at a
-    time with the '30 min' model, feeding each prediction back in to predict
-    the next step.
-
-    Because the model consumes its own predictions, small errors accumulate
-    over time ("drift"): the curve is very accurate at first and slowly
-    departs from reality further out. This is expected and illustrates why
-    long-range forecasting is hard.
-
-    Weather / calendar features at each future step are taken from the data
-    (we demonstrate on known 2023 dates). Only the consumption-based features
-    (lags, rolling means) are rebuilt from the predictions so far.
-
-    Returns a pandas Series (index = future timestamps, values = predicted MW).
-    """
-    model = models["30 min"]
-    chosen = pd.Timestamp(chosen)
-
-    # Known consumption up to and including the chosen moment
-    known = df_features["consumption"].copy()
-
-    preds = []
-    times = []
-
-    for i in range(1, n_steps + 1):
-        target = chosen + pd.Timedelta(minutes=30 * i)
-        if target not in df_features.index:
-            break
-
-        # Start from the real feature row at the target time (weather, calendar)
-        x = df_features.loc[[target - pd.Timedelta(minutes=30)], FEATURE_COLUMNS].copy()
-
-        # Rebuild the consumption-based features from what we know + predicted
-        # so far. 'series' = real past values followed by our predictions.
-        series = pd.concat([known.loc[:chosen], pd.Series(preds, index=times)])
-
-        def val_at(delta_steps):
-            t = target - pd.Timedelta(minutes=30 * delta_steps)
-            return series.get(t, series.iloc[-1])
-
-        # Overwrite the lag/rolling features with values consistent with the
-        # recursive prediction (the previous instant is 1 step before target)
-        x["lag_30min"] = series.iloc[-1]                       # 1 step back
-        x["lag_1h"]    = val_at(2)
-        x["lag_24h"]   = val_at(48)
-        x["lag_7d"]    = val_at(336)
-        last_values = series.iloc[-4:]
-        x["roll_mean_2h"] = last_values.mean() if len(last_values) else series.iloc[-1]
-        last_day = series.iloc[-48:]
-        x["roll_mean_24h"] = last_day.mean() if len(last_day) else series.iloc[-1]
-
-        p = float(model.predict(x)[0])
-        preds.append(p)
-        times.append(target)
-
-    return pd.Series(preds, index=times)
+def load_bundle(path=BUNDLE_FILE):
+    bundle = joblib.load(path)
+    if bundle["features"] != FEATURE_COLUMNS:
+        raise RuntimeError("Saved models do not match the code: run `python src/script.py`.")
+    return bundle
 
 
 # ===========================================================================
@@ -505,47 +646,28 @@ def recursive_forecast(chosen, df_features, models, n_steps=336):
 # ===========================================================================
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    t0 = time.time()
 
     print("Loading data...")
-    df = load_data()
+    df = load_excel()
+    df.to_parquet(CLEAN_DATA_FILE)
     print(f"  {len(df)} rows, from {df.index.min()} to {df.index.max()}")
 
     print("Building features...")
-    df_feat = build_features(df)
-    print(f"  {len(df_feat)} rows after feature engineering")
+    data = prepare_dataset(df)
 
-    print("Splitting (train: 2021-2022, test: 2023)...")
-    train, test = chronological_split(df_feat)
-    print(f"  train: {len(train)} rows | test: {len(test)} rows")
+    print(f"\nTraining {len(LEAD_BUCKETS)} lead ranges x 3 models "
+          f"(train < {VALID_START.date()}, validation until {TEST_YEAR - 1}-12-31):")
+    models, iterations = train_models(data)
 
-    print("\nTraining models:\n")
-    models, scores = train_all_models(train, test)
+    print(f"\nEvaluation on {TEST_YEAR} (MAPE %, lower is better):")
+    report = evaluate(data, models)
 
-    print("\nSummary:")
-    print(scores.to_string(index=False))
+    save_bundle(models, iterations, report)
+    print(f"\nModels and report saved in '{BUNDLE_FILE}' ({time.time() - t0:.0f}s total).")
 
-    # Save everything
-    for name, model in models.items():
-        safe = name.replace(" ", "_")
-        joblib.dump(model, os.path.join(RESULTS_DIR, f"model_{safe}.pkl"))
-    joblib.dump(FEATURE_COLUMNS, os.path.join(RESULTS_DIR, "feature_columns.pkl"))
-    df_feat.to_csv(os.path.join(RESULTS_DIR, "data_with_features.csv"))
-    print(f"\nModels and data saved in '{RESULTS_DIR}/'.")
-
-    # ---- Multi-step models for the continuous forecast curve ----
-    print(f"\nTraining {len(MULTISTEP_GRID)} multi-step models "
-          "(continuous curve, no drift)... this takes about a minute.")
-    multistep = train_multistep_models(train)
-    joblib.dump(multistep, os.path.join(RESULTS_DIR, "models_multistep.pkl"))
-    print("Multi-step models saved.")
-
-    # ---- Example prediction ----
-    print("\n" + "=" * 55)
-    print("EXAMPLE: forecast from 2023-06-27 08:30")
-    print("=" * 55)
-    predict_from_datetime("2023-06-27 08:30", df_feat, models, verbose=True)
-
-    return df_feat, models
+    print("\nExample: forecast from 2023-06-27 08:30")
+    print(horizon_table(forecast("2023-06-27 08:30", data, models)).to_string(index=False))
 
 
 if __name__ == "__main__":

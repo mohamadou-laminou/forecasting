@@ -1,0 +1,12 @@
+pandas==3.0.3
+numpy==2.5.1
+openpyxl==3.1.5
+pyarrow==24.0.0
+lightgbm==4.6.0
+scikit-learn==1.9.0
+joblib==1.5.3
+jours_feries_france==0.7.0
+vacances_scolaires_france==0.11.0
+streamlit==1.59.2
+plotly==6.9.0
+matplotlib==3.11.2   # report figures only
